@@ -24,12 +24,32 @@ $ProgressPreference    = 'SilentlyContinue'
 $env:WSL_UTF8 = '1'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
+# --------------------- 路径推导（无硬编码） ---------------------
+# 本脚本所在目录即项目根目录，所有路径由它推导。这样整个目录可以
+# 原样复制到任何位置（含换盘符）而无需改代码。
+# 用 -File 方式调用时 $PSScriptRoot 一定有值；若为空（例如把脚本内容
+# 直接粘进命令行执行），推导会失效，此处明确报错而不是继续跑错路径。
+$BaseDir = $PSScriptRoot
+if ([string]::IsNullOrEmpty($BaseDir)) {
+    throw '无法确定脚本所在目录（$PSScriptRoot 为空）。请用 -File 方式运行本脚本。'
+}
+
+# 把本机 Windows 路径转成 distro 内可见的 /mnt/<小写盘符>/... 路径，
+# 供 wsl.exe 直接读取（例如把 apt 脚本 cp 进 distro）。
+function ConvertTo-WslPath {
+    param([Parameter(Mandatory)][string]$WindowsPath)
+    $p = $WindowsPath -replace '\\', '/'
+    if ($p -match '^([A-Za-z]):/(.*)$') {
+        return '/mnt/' + $Matches[1].ToLowerInvariant() + '/' + $Matches[2]
+    }
+    throw "无法转换为 WSL 路径（需为 <盘符>:\... 形式）: $WindowsPath"
+}
+
 # ---------------------------- 配置 ----------------------------
-$BaseDir             = 'C:\Users\Administrator\.wsl-autoupdate'
 $DownloadDir         = Join-Path $BaseDir 'downloads'
 $LogFile             = Join-Path $BaseDir 'wsl-autoupdate.log'
 $AptScriptHost       = Join-Path $BaseDir 'wsl-autoupdate-apt.sh'
-$AptScriptHostWsl    = '/mnt/c/Users/Administrator/.wsl-autoupdate/wsl-autoupdate-apt.sh'
+$AptScriptHostWsl    = ConvertTo-WslPath $AptScriptHost
 $Distro              = 'Ubuntu'
 $WslExe              = Join-Path $env:SystemRoot 'System32\wsl.exe'
 $CurlExe             = Join-Path $env:SystemRoot 'System32\curl.exe'
@@ -219,6 +239,11 @@ function Request-Consent {
 $exitCode = 0
 Write-Log ('=' * 68)
 Write-Log 'WSL 自动更新任务开始'
+
+# 记录本次解析出的路径：路径全部由脚本位置推导，出问题时这行能立刻
+# 看出脚本是从哪个目录跑的、以及转换成 distro 视角后是什么
+Write-Log "项目目录: $BaseDir"
+Write-Log "apt 脚本: $AptScriptHost  ==> distro: $AptScriptHostWsl"
 
 # ---------- 阶段 0：记录 distro 初始状态 ----------
 # 用于判断“关闭 WSL 是否会打断用户”。若任务开始前 distro 本来就是 Running，

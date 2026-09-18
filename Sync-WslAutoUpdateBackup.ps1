@@ -13,19 +13,56 @@
  默认是非破坏性的：只覆盖和新增，不删除备份目录里多出来的文件
  （对备份而言，多留一份通常比误删安全）。需要严格镜像时加 -Mirror。
 
+ 路径解析（无需改代码）：
+   源目录   默认 = 本脚本所在目录，可用 -Source 覆盖
+   备份目录 优先级 = -Dest 参数 > settings.psd1 的 BackupDir
+                     > $env:USERPROFILE\.wsl-autoupdate-backup
+
  用法：
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Sync-WslAutoUpdateBackup.ps1
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Sync-WslAutoUpdateBackup.ps1 -Mirror
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Sync-WslAutoUpdateBackup.ps1 -Dest 'E:\bak\wsl'
 ================================================================
 #>
 [CmdletBinding()]
 param(
-    [string]$Source = 'C:\Users\Administrator\.wsl-autoupdate',
-    [string]$Dest   = 'D:\Workspace_Python\.wsl-autoupdate',
+    [string]$Source,
+    [string]$Dest,
     [switch]$Mirror
 )
 
 $ErrorActionPreference = 'Stop'
+
+# --- 源目录：默认就是本脚本所在目录（即项目根目录），无需硬编码 ---
+if ([string]::IsNullOrEmpty($Source)) {
+    if ([string]::IsNullOrEmpty($PSScriptRoot)) {
+        throw '无法确定脚本所在目录（$PSScriptRoot 为空）。请用 -File 方式运行本脚本。'
+    }
+    $Source = $PSScriptRoot
+}
+
+# --- 备份目录：属于部署决策，无法从代码推导，按以下优先级取值 ---
+#   1) 命令行 -Dest
+#   2) 同目录下 settings.psd1 的 BackupDir
+#   3) 回退到 $env:USERPROFILE\.wsl-autoupdate-backup（可移植，不写死盘符）
+# 用 Import-PowerShellDataFile 读取 .psd1：它只解析数据、不执行代码。
+$destSource = '-Dest 参数'
+if ([string]::IsNullOrEmpty($Dest)) {
+    $Dest       = Join-Path $env:USERPROFILE '.wsl-autoupdate-backup'
+    $destSource = '内置回退值'
+    $settingsFile = Join-Path $Source 'settings.psd1'
+    if (Test-Path $settingsFile) {
+        $settings = Import-PowerShellDataFile -Path $settingsFile
+        if ($settings.ContainsKey('BackupDir') -and -not [string]::IsNullOrEmpty($settings.BackupDir)) {
+            $Dest       = $settings.BackupDir
+            $destSource = 'settings.psd1'
+        } else {
+            Write-Warning "settings.psd1 存在但未提供有效的 BackupDir，改用内置回退值：$Dest"
+        }
+    } else {
+        Write-Warning "未找到 settings.psd1，改用内置回退值：$Dest（可复制 settings.example.psd1 为 settings.psd1 来指定）"
+    }
+}
 
 $ExcludeDirs  = @('downloads', '.git')
 $ExcludeGlobs = @('*.log', '*.log.*', '*.msi', '_*.ps1')
@@ -80,8 +117,8 @@ if ($Mirror) {
 }
 
 ''
-"源目录   : $Source"
-"备份目录 : $Dest"
+"源目录   : $Source   （来源: 脚本所在目录或 -Source）"
+"备份目录 : $Dest   （来源: $destSource）"
 ''
 "已同步 ({0}):" -f $copied.Count
 foreach ($c in $copied) { "  + $c" }

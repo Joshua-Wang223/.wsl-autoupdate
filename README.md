@@ -54,11 +54,15 @@ Windows 计划任务 "WSL Auto Update"（每日 03:30，仅用户登录时运行
 | `wsl-autoupdate-apt.sh` | 在 Ubuntu 内执行 apt 的脚本。每次运行由主线用 `cp` 覆盖同步到 distro 的 `/usr/local/sbin/`，因此**改 Windows 侧这份就会自动生效** | ✅ |
 | `Register-WslAutoUpdateTask.ps1` | 注册 / 卸载 / 改时间。整套配置可复现，重装系统后一条命令恢复 | ✅ |
 | `Sync-WslAutoUpdateBackup.ps1` | 把脚本同步到备份目录 | ✅ |
-| `.gitignore` | 挡掉 `downloads/`、`*.msi`、运行日志、`_*.ps1` | ✅ |
+| `settings.example.psd1` | 部署设置模板。复制为 `settings.psd1` 后填写自己的值 | ✅ |
+| `settings.psd1` | 本机部署设置（备份目录）。已 gitignore，不进仓库 | ❌ |
+| `.gitignore` | 挡掉 `downloads/`、`*.msi`、运行日志、`settings.psd1`、`_*.ps1` | ✅ |
 | `wsl-autoupdate.log` | 运行日志，超 2 MB 轮转为 `.log.1` | ❌ |
 | `downloads\` | 引擎 MSI（约 247 MB/个）与 msiexec 安装日志 | ❌ |
 
 distro 内另有部署副本：`/usr/local/sbin/wsl-autoupdate-apt.sh`
+
+**关于路径**：所有路径都由脚本自身位置推导（见下方「路径推导」），因此**整个目录可以原样复制到任何位置或盘符，无需改代码**。唯一无法推导的是备份目录，它放在 `settings.psd1` 里。
 
 ---
 
@@ -73,13 +77,15 @@ distro 内另有部署副本：`/usr/local/sbin/wsl-autoupdate-apt.sh`
 ### 部署
 
 ```powershell
-# 1. 放到固定目录
+# 1. 克隆到任意目录 —— 路径会自动推导，放哪都行
 git clone https://github.com/Joshua-Wang223/.wsl-autoupdate.git "$env:USERPROFILE\.wsl-autoupdate"
 
-# 2. 按实际情况修改配置区（见下方「适配到其他机器」）
+# 2. 指定备份目录（可选。不建此文件则回退到 $env:USERPROFILE\.wsl-autoupdate-backup）
+cd "$env:USERPROFILE\.wsl-autoupdate"
+Copy-Item settings.example.psd1 settings.psd1
+notepad settings.psd1
 
 # 3. 注册计划任务（需管理员）
-cd "$env:USERPROFILE\.wsl-autoupdate"
 .\Register-WslAutoUpdateTask.ps1
 ```
 
@@ -90,14 +96,15 @@ cd "$env:USERPROFILE\.wsl-autoupdate"
 ### 手动触发完整升级
 
 ```powershell
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass `
-  -File "C:\Users\Administrator\.wsl-autoupdate\Invoke-WslAutoUpdate.ps1"
+cd "$env:USERPROFILE\.wsl-autoupdate"   # 换成你实际克隆到的目录
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Invoke-WslAutoUpdate.ps1
 ```
 
 脚本把过程写进日志而非屏幕，跑完请看日志。
 
 > `-STA` 不能省略 —— 同意弹窗基于 WinForms，需要 STA 线程。
 > 若此时你开着 WSL 终端，会看到同意弹窗。
+> 路径都从脚本位置推导，所以只要 `-File` 指向的那份脚本对了，其余全对。
 
 ### 通过计划任务触发
 
@@ -140,15 +147,16 @@ curl -L -C - --speed-limit 2048 --speed-time 25 -o wsl.msi <上一步拿到的 U
 ### 手动备份
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File "C:\Users\Administrator\.wsl-autoupdate\Sync-WslAutoUpdateBackup.ps1"
+cd "$env:USERPROFILE\.wsl-autoupdate"   # 换成你实际克隆到的目录
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Sync-WslAutoUpdateBackup.ps1
 ```
 
 | 参数 | 说明 |
 |---|---|
-| 无 | 非破坏性，只覆盖 / 新增 |
+| 无 | 非破坏性，只覆盖 / 新增；备份目录取 `settings.psd1` 的 `BackupDir` |
 | `-Mirror` | 额外删除备份目录里多出来的文件 |
-| `-Source` / `-Dest` | 覆盖默认路径 |
+| `-Source` | 覆盖源目录（默认即脚本所在目录） |
+| `-Dest` | 覆盖备份目录（优先级最高） |
 
 用 SHA256 比对决定是否覆盖，输出会明确区分「已同步」与「未变化」，因此重复执行是安全的。
 
@@ -169,19 +177,52 @@ winget install Microsoft.WSL --version 2.7.14.0
 
 ---
 
+## 路径推导
+
+脚本里**不含任何硬编码绝对路径**。`Invoke-WslAutoUpdate.ps1` 以自身所在目录（`$PSScriptRoot`）为项目根目录，推导出全部路径：
+
+| 路径 | 推导方式 |
+|---|---|
+| 项目根目录 | `$PSScriptRoot` |
+| apt 脚本（本机视角） | `<根目录>\wsl-autoupdate-apt.sh` |
+| apt 脚本（distro 视角） | 由上一项转换：`<盘符>:\...` → `/mnt/<小写盘符>/...` |
+| 运行日志 | `<根目录>\wsl-autoupdate.log` |
+| `downloads\` | `<根目录>\downloads` |
+
+因此把整个目录复制到别的路径甚至别的盘符后，**不需要改任何代码**即可运行。已实测：整体复制到 `D:\Temp\...` 后正常运行，apt 脚本通过 `/mnt/d/...` 成功 `cp` 进 distro，全程退出码 0。
+
+转换函数 `ConvertTo-WslPath` 遇到非 `<盘符>:\...` 形式的路径会**直接抛错**，而不是静默返回一个错误路径 —— 这类静默错误最难排查。每次运行也会把解析结果写进日志头两行，出问题时一眼可查：
+
+```
+[INFO ] 项目目录: D:\Temp\wsl-au-portability-test
+[INFO ] apt 脚本: D:\Temp\...\wsl-autoupdate-apt.sh  ==> distro: /mnt/d/Temp/.../wsl-autoupdate-apt.sh
+```
+
+**唯一无法推导的是备份目录**，它属于部署决策，放在 `settings.psd1`：
+
+| 优先级 | 取值来源 |
+|:--:|---|
+| 1 | 命令行 `-Dest` 参数 |
+| 2 | `settings.psd1` 的 `BackupDir` |
+| 3 | 回退到 `$env:USERPROFILE\.wsl-autoupdate-backup` |
+
+`settings.psd1` 由 `Import-PowerShellDataFile` 读取（只解析数据、不执行代码）。同步脚本会打印实际取值来源，便于确认。
+
+---
+
 ## 配置项
 
-都在 `Invoke-WslAutoUpdate.ps1` 顶部配置区（第 28–41 行），改完无需改动其他代码：
+都在 `Invoke-WslAutoUpdate.ps1` 顶部配置区，改完无需改动其他代码：
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `$BaseDir` | `C:\Users\Administrator\.wsl-autoupdate` | 部署目录 |
-| `$AptScriptHostWsl` | `/mnt/c/Users/Administrator/.wsl-autoupdate/wsl-autoupdate-apt.sh` | apt 脚本在 distro 视角下的源路径 |
 | `$Distro` | `Ubuntu` | 目标发行版名 |
 | `$ConsentSeconds` | `300` | 弹窗无响应多少秒后自动同意 |
 | `$MaxDownloadAttempts` | `80` | 断点续传最多重试次数 |
 | `$KeepEngineMsi` | `2` | `downloads\` 内保留的 MSI 个数 |
 | `$KeepInstallLog` | `2` | `downloads\` 内保留的安装日志个数 |
+
+路径相关的项不在上表中 —— 它们全部由脚本位置推导，无需也不应手工配置。
 
 ---
 
@@ -299,16 +340,37 @@ WSL 的发行版注册在 `HKCU` 下（每用户一份），且需要在关闭 W
 
 ## 适配到其他机器
 
-脚本中存在硬编码的绝对路径，克隆后需要修改：
+**不需要改代码。** 整个目录可以原样复制到任何位置或盘符。
 
-| 文件 | 需修改 |
+| 要做的 | 说明 |
 |---|---|
-| `Invoke-WslAutoUpdate.ps1` | 第 28 行 `$BaseDir`、第 32 行 `$AptScriptHostWsl` |
-| `Sync-WslAutoUpdateBackup.ps1` | 第 23/24 行 `-Source` / `-Dest` 默认值（也可用参数覆盖） |
-| `Register-WslAutoUpdateTask.ps1` | 无 —— 用 `$PSScriptRoot` 与动态取当前用户，可直接使用 |
-| `wsl-autoupdate-apt.sh` | 无 |
+| 复制 / 克隆目录 | 放哪都行，所有路径自动推导 |
+| 建 `settings.psd1` | 指定备份目录；不建则回退到 `$env:USERPROFILE\.wsl-autoupdate-backup` |
+| 注册计划任务 | `.\Register-WslAutoUpdateTask.ps1`（内部用 `$PSScriptRoot` 与动态取当前用户） |
+| 非 Ubuntu 发行版 | 改 `Invoke-WslAutoUpdate.ps1` 里的 `$Distro` |
 
-另外备份目录默认为 `D:\Workspace_Python\.wsl-autoupdate`，请按自己的布局调整。
+各文件的硬编码路径现状：
+
+| 文件 | 硬编码绝对路径 |
+|---|---|
+| `Invoke-WslAutoUpdate.ps1` | **无** —— 全部由 `$PSScriptRoot` 推导 |
+| `Sync-WslAutoUpdateBackup.ps1` | **无** —— `-Source` 默认脚本所在目录，`-Dest` 走 `settings.psd1` |
+| `Register-WslAutoUpdateTask.ps1` | **无** |
+| `wsl-autoupdate-apt.sh` | **无** |
+
+> ⚠️ **移动了项目目录后，必须重新注册一次计划任务。**
+> 计划任务里存的是注册当时的脚本绝对路径 —— 那是运行期数据而非源码硬编码，但目录一移就成了失效的旧路径。重新注册即可刷新：
+>
+> ```powershell
+> cd <新目录>
+> .\Register-WslAutoUpdateTask.ps1
+> ```
+>
+> 验证是否指向正确位置：
+>
+> ```powershell
+> (Get-ScheduledTask -TaskName 'WSL Auto Update').Actions[0].Arguments
+> ```
 
 ---
 
@@ -321,10 +383,14 @@ WSL 的发行版注册在 `HKCU` 下（每用户一份），且需要在关闭 W
 .\Sync-WslAutoUpdateBackup.ps1
 
 # 2. 提交并推送
-cd C:\Users\Administrator\.wsl-autoupdate
 git add -A
 git commit -m "说明本次改动"
 git push
 ```
 
 若改的是 `wsl-autoupdate-apt.sh`，下次运行会自动同步进 distro；想立刻生效就手动触发一次完整升级。
+
+补充两点：
+
+- 新增的脚本文件会被同步脚本**自动纳入**（排除规则是黑名单，不是白名单），无需改同步脚本。
+- `settings.psd1` 会被**同步进备份**（它是部署状态的一部分，恢复时用得上），但它**不会进仓库**。
