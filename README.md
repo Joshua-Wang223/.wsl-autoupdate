@@ -76,7 +76,7 @@ Windows 计划任务 "WSL Auto Update"（每日 03:30，仅用户登录时运行
 | `Invoke-WslAutoUpdate.ps1` | 主编排脚本。计划任务真正调用的就是它，阶段 0/A/B/收尾都在这里 | ✅ |
 | `wsl-autoupdate-apt.sh` | 在 Ubuntu 内执行 apt 的脚本。每次运行由主线用 `cp` 覆盖同步到 distro 的 `/usr/local/sbin/`，因此**改 Windows 侧这份就会自动生效** | ✅ |
 | `Register-WslAutoUpdateTask.ps1` | 注册 / 卸载 / 改时间。整套配置可复现，重装系统后一条命令恢复 | ✅ |
-| `Sync-WslAutoUpdateBackup.ps1` | 把脚本同步到备份目录 | ✅ |
+| `Sync-WslAutoUpdateBackup.ps1` | 把项目同步到备份目录，**含 `.git` 完整历史**，使备份成为可用于恢复的完整副本 | ✅ |
 | `settings.example.psd1` | 部署设置模板。复制为 `settings.psd1` 后填写自己的值 | ✅ |
 | `settings.psd1` | 本机部署设置（备份目录）。已 gitignore，不进仓库 | ❌ |
 | `.gitignore` | 挡掉 `downloads/`、`*.msi`、运行日志、`settings.psd1`、`_*.ps1` | ✅ |
@@ -182,6 +182,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Sync-WslAutoUpdateBack
 | `-Dest` | 覆盖备份目录（优先级最高） |
 
 用 SHA256 比对决定是否覆盖，输出会明确区分「已同步」与「未变化」，因此重复执行是安全的。
+
+**备份是「带完整历史的仓库」**，不是单纯的脚本副本：
+
+| 内容 | 是否进备份 |
+|---|:---:|
+| 项目工作树（脚本、README、`.gitignore`） | ✅ |
+| **`.git`（完整提交历史）** | ✅ |
+| `settings.psd1`（本机部署设置，不在版本控制内） | ✅ |
+| `downloads\`（引擎 MSI，单个 250–370 MB） | ❌ |
+| 运行日志（含主机名与本机路径） | ❌ |
+
+所以备份目录里可以直接 `git log` 看改动、`git checkout` 回退版本，是**可用于恢复的完整副本**。同步结束时脚本会核对两边的 HEAD 是否一致，并打印备份侧能读到的最新提交 —— 这一步会当场暴露「`.git` 没同步过去」之类的问题（实测就抓到过一次）。
+
+> ⚠️ 备份是**镜像**，不是工作副本。别在备份目录里改代码再指望同步回源；要改请改源目录，然后跑本脚本。
+>
+> 另：同步期间不要在源仓库里跑 git 写操作。拷贝 `.git` 时会话到一半的索引 / 引用可能不完整；同步结束的 HEAD 校验能发现，但最好避免。
+
 
 ### 注册 / 卸载 / 改时间
 
@@ -414,7 +431,8 @@ git push
 
 若改的是 `wsl-autoupdate-apt.sh`，下次运行会自动同步进 distro；想立刻生效就手动触发一次完整升级。
 
-补充两点：
+补充三点：
 
 - 新增的脚本文件会被同步脚本**自动纳入**（排除规则是黑名单，不是白名单），无需改同步脚本。
 - `settings.psd1` 会被**同步进备份**（它是部署状态的一部分，恢复时用得上），但它**不会进仓库**。
+- `.git` 也会被同步进备份，所以备份带完整历史。注意 `Get-ChildItem -Recurse` 默认会跳过隐藏目录（`git init` 给 `.git` 加了隐藏属性），同步脚本里必须带 `-Force` —— 这点踩过坑，已在脚本注释里说明。

@@ -3,9 +3,15 @@
 ================================================================
  把 WSL 自动更新的脚本同步到备份目录
 
- 只同步脚本本体，**不含**：
-   - downloads\ —— 内含约 247 MB 的引擎 MSI
+ 同步内容 = 项目工作树 + .git（完整版本历史）
+ 备份目录因此是一个「带历史、可直接使用的仓库」：既能直接取用脚本，
+ 也能 git log 查改动、git checkout 回退到任意版本。
+ **不含**：
+   - downloads\ —— 内含引擎 MSI（单个 250–370 MB），体积过大
    - 运行日志（wsl-autoupdate.log）—— 含主机名与本机路径，属运行时产物
+
+ 注意：备份是**镜像**，不是工作副本。别在备份目录里改代码再指望同步回源；
+   要改请改源目录，然后跑本脚本。
 
  排除规则集中在 $ExcludeDirs / $ExcludeGlobs，所以将来新增的脚本
  会被自动纳入同步，不需要改这个文件。
@@ -64,7 +70,10 @@ if ([string]::IsNullOrEmpty($Dest)) {
     }
 }
 
-$ExcludeDirs  = @('downloads', '.git')
+# .git 一并同步，让备份也成为带完整历史的仓库。
+# 它只有几百 KB（46 个文件），且内部没有会被 $ExcludeGlobs 误伤的文件名。
+# 前提：同步期间不要有 git 命令在源仓库里写（本脚本自身不调用 git 写操作）。
+$ExcludeDirs  = @('downloads')
 $ExcludeGlobs = @('*.log', '*.log.*', '*.msi', '_*.ps1')
 
 if (-not (Test-Path $Source)) { throw "源目录不存在: $Source" }
@@ -74,7 +83,10 @@ if (-not (Test-Path $Dest)) {
 }
 
 # 挑选待同步文件：排除 $ExcludeDirs 下的内容与匹配 $ExcludeGlobs 的文件
-$items = Get-ChildItem -Path $Source -Recurse -File | Where-Object {
+# 必须加 -Force：git init 在 Windows 上会给 .git 目录加上隐藏属性，而
+# Get-ChildItem -Recurse 默认既不返回隐藏项、也不递归进隐藏目录，
+# 不加的话 .git 会被整个跳过、备份就拿不到版本历史（曾实测踩到）。
+$items = Get-ChildItem -Path $Source -Recurse -File -Force | Where-Object {
     $rel   = $_.FullName.Substring($Source.Length).TrimStart('\')
     $first = ($rel -split '\\')[0]
     if ($ExcludeDirs -contains $first) { return $false }
@@ -106,7 +118,9 @@ foreach ($f in $items) {
 
 $removed = @()
 if ($Mirror) {
-    foreach ($f in @(Get-ChildItem -Path $Dest -Recurse -File)) {
+    # 同样要 -Force，否则 .git 隐藏目录不会被纳入镜像比较，旧的 git 对象
+    # 永远清不掉，-Mirror 就名不副实
+    foreach ($f in @(Get-ChildItem -Path $Dest -Recurse -File -Force)) {
         $rel = $f.FullName.Substring($Dest.Length).TrimStart('\')
         $inSource = Test-Path (Join-Path $Source $rel)
         if (-not $inSource) {
@@ -114,6 +128,30 @@ if ($Mirror) {
             $removed += $rel
         }
     }
+}
+
+# --- 校验备份里的 git 仓库：除了「文件拷过来了」，还要能读、且与源同一提交 ---
+# 备份现在含 .git，所以光看文件是否复制成功不够 —— 还须确认历史可用且没有
+# 落后于源（例如拷贝期间源仓库正在变动，或排除规则把 .git 漏掉了）。
+$repoCheck = @()
+if (Test-Path (Join-Path $Source '.git')) {
+    if (-not (Test-Path (Join-Path $Dest '.git'))) {
+        $repoCheck += '备份目录缺少 .git —— 历史未同步，请检查排除规则'
+    } else {
+        $srcHead  = (& git -C $Source rev-parse HEAD 2>$null | Select-Object -First 1)
+        $destHead = (& git -C $Dest   rev-parse HEAD 2>$null | Select-Object -First 1)
+        $destLog  = (& git -C $Dest   log --oneline -1 2>$null | Select-Object -First 1)
+        $repoCheck += "源   HEAD   : $srcHead"
+        $repoCheck += "备份 HEAD   : $destHead"
+        if ($srcHead -and ($srcHead -eq $destHead)) {
+            $repoCheck += '历史校验    : 一致 ✓'
+        } else {
+            $repoCheck += '历史校验    : 不一致 ✗ 备份历史与源不同步'
+        }
+        $repoCheck += "备份最新提交: $destLog"
+    }
+} else {
+    $repoCheck += '源目录不是 git 仓库，跳过历史校验'
 }
 
 ''
@@ -129,7 +167,11 @@ if ($Mirror) {
     foreach ($r in $removed) { "  - $r" }
 }
 ''
-'备份目录内容:'
+'版本历史校验:'
+foreach ($l in $repoCheck) { "  $l" }
+''
+'备份目录内容（不含 .git 内部）:'
 Get-ChildItem -Path $Dest -Recurse -File |
+    Where-Object { $_.FullName.Substring($Dest.Length).TrimStart('\') -notlike '.git\*' } |
     Select-Object @{n='相对路径';e={$_.FullName.Substring($Dest.Length).TrimStart('\')}}, Length, LastWriteTime |
     Format-Table -AutoSize
