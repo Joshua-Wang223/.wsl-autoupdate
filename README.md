@@ -77,6 +77,7 @@ Windows 计划任务 "WSL Auto Update"（每日 03:30，仅用户登录时运行
 | `wsl-autoupdate-apt.sh` | 在 Ubuntu 内执行 apt 的脚本。每次运行由主线用 `cp` 覆盖同步到 distro 的 `/usr/local/sbin/`，因此**改 Windows 侧这份就会自动生效** | ✅ |
 | `Register-WslAutoUpdateTask.ps1` | 注册 / 卸载 / 改时间。整套配置可复现，重装系统后一条命令恢复 | ✅ |
 | `Sync-WslAutoUpdateBackup.ps1` | 把项目同步到备份目录，**含 `.git` 完整历史**，使备份成为可用于恢复的完整副本 | ✅ |
+| `Test-WslHealth.ps1` | WSL 健康检查工具（**只读**，不会关 WSL）。体检超虚拟机 / BCD / 服务 / 引擎 / 发行版 / 能否启动 | ✅ |
 | `settings.example.psd1` | 部署设置模板。复制为 `settings.psd1` 后填写自己的值 | ✅ |
 | `settings.psd1` | 本机部署设置（备份目录）。已 gitignore，不进仓库 | ❌ |
 | `.gitignore` | 挡掉 `downloads/`、`*.msi`、运行日志、`settings.psd1`、`_*.ps1` | ✅ |
@@ -251,6 +252,41 @@ $m = [regex]::Match($t.Actions[0].Arguments, '-File\s+"([^"]+)"')
 **没弹窗不代表没工作。** 同意弹窗只在「`distro` 原本是 `Running` **且** GitHub 上有更新版本」时才出现。平时最常见的是「引擎已是最新」直接跳过，或「distro 一直在跑」被安全闸挡下 —— 两种情况都静默完成，详见上方「工作原理」与「设计要点与已知坑」。
 
 > 上面几条命令的输出是中文，PowerShell 控制台可能因代码页显示乱码 —— 那只是显示问题，不影响判断。用支持 UTF-8 的终端，或先 `chcp 65001`。
+
+### WSL 健康检查
+
+`Test-WslHealth.ps1` 按需体检 WSL 子系统，判断「还能不能正常用」。典型场景：重启后发现 WSL 起不来、排查完某个问题后确认已恢复、定期巡检。
+
+```powershell
+cd "$env:USERPROFILE\.wsl-autoupdate"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-WslHealth.ps1
+```
+
+| 参数 | 说明 |
+|---|---|
+| 无 | 检查默认发行版，含启动测试 |
+| `-Distro <名称>` | 指定要检查的发行版 |
+| `-SkipBootTest` | 跳过启动测试 —— **完全不碰 distro** |
+| `-LogPath <文件>` | 同时写入日志（默认只输出到控制台） |
+
+**检查 6 组：**
+
+| 组 | 检查内容 | 判级 |
+|---|---|---|
+| 1 | `HypervisorPresent` —— 超虚拟机是否已加载 | 未加载 = FAIL（WSL2 起不来） |
+| 2 | BCD `hypervisorlaunchtype` 应为 `Auto` | 非 `Auto` = FAIL；读不到（无管理员）= SKIP |
+| 3 | `WslService` / `vmcompute` / `HvHost` / `hns` | `WslService` 非 Running = FAIL；其余按需启动，Stopped = WARN |
+| 4 | 引擎与内核版本（`wsl --version`） | 解析失败 = FAIL |
+| 5 | 发行版清单与状态（`wsl -l -v`） | 指定的发行版不存在 = FAIL |
+| 6 | 启动测试：真在 distro 里跑命令并校验哨兵字符串 | 取不到哨兵 = FAIL |
+
+**退出码**：`0` 通过 ｜ `1` 存在 FAIL ｜ `2` 脚本自身无法运行 —— 便于脚本化或定时巡检。
+
+> ⚠️ **它是只读的**：绝不调用 `wsl --shutdown` / `wsl --terminate`，不会中断 WSL 里正在跑的任务。唯一副作用是启动测试会在 distro 处于 `Stopped` 时把它唤醒 —— 这与关机性质完全不同，不会打断任何东西；想完全不碰 distro 就加 `-SkipBootTest`。
+>
+> 启动测试的哨兵字符串**本身就是一道编码检查**：若 wsl 输出被错误解码，哨兵会变成乱码而匹配不上、直接报 FAIL。这正是 2026-09-17 那次「把成功误报成失败」的坑，现在会被主动暴露而不是静默误判。
+>
+> 本脚本刻意自包含：**不要 dot-source `Invoke-WslAutoUpdate.ps1` 来复用它的函数** —— 那个脚本没有「只定义不执行」的守卫，dot-source 会真的触发一次升级流程（含 apt 更新，甚至在有新版时关闭 WSL）。
 
 ---
 
@@ -509,6 +545,11 @@ Get-ScheduledTaskInfo -TaskName 'WSL Auto Update' |
 tail -40 /c/Users/Administrator/.wsl-autoupdate/wsl-autoupdate.log
 ```
 
+```powershell
+# WSL 本身是否健康（只读，不影响正在跑的 WSL 任务）
+.\Test-WslHealth.ps1
+```
+
 | 现象 | 先看哪里 |
 |---|---|
 | 任务没跑 | `State` 是否为 `Disabled`；`LastRunTime` 有没有更新 |
@@ -516,6 +557,7 @@ tail -40 /c/Users/Administrator/.wsl-autoupdate/wsl-autoupdate.log
 | 引擎版本没变 | 日志里搜「跳过」—— 多半是 distro 一直在跑、被安全闸挡下（这是设计行为） |
 | 弹窗没出现 | 只在「distro 原本 Running **且**有新版引擎」时才弹；无新版则不弹 |
 | apt 失败 | 日志里 `### apt-get update 退出码` 与 `### dpkg 状态` 两行 |
+| **WSL 本身起不来** | 跑 `.\Test-WslHealth.ps1`，它会逐项指出卡在哪（超虚拟机 / BCD / 服务 / 引擎 / 发行版 / 启动） |
 
 ### 两条容易被忽略的注意事项
 
