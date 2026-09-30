@@ -215,6 +215,43 @@ winget install Microsoft.WSL --version 2.7.14.0
 # 或用 downloads\ 中保留的上一个版本 MSI 重新安装
 ```
 
+### 验证任务状态
+
+想知道任务是否健康、上次跑成没成功，跑下面这些。**都不需要管理员权限。**
+
+```powershell
+# 一条命令看全貌
+$t = Get-ScheduledTask -TaskName 'WSL Auto Update'
+$i = Get-ScheduledTaskInfo -TaskName 'WSL Auto Update'
+"状态      : $($t.State)"
+"执行身份  : $($t.Principal.UserId)  ($($t.Principal.LogonType), $($t.Principal.RunLevel))"
+foreach ($tr in $t.Triggers) { "触发器    : $($tr.CimClass.CimClassName)  起始 $($tr.StartBoundary)" }
+"动作      : $($t.Actions[0].Arguments)"
+"上次运行  : $($i.LastRunTime)   结果码 $($i.LastTaskResult)"
+"下次运行  : $($i.NextRunTime)"
+```
+
+**怎么判断「健康」：**
+
+| 看到 | 含义 |
+|---|---|
+| `State = Ready` | 已启用 ✓（`Disabled` = 被暂停了） |
+| `LastTaskResult = 0` | 上次运行成功 ✓ |
+| `NextRunTime` 是未来时间 | 调度正常 ✓ |
+| 日志末尾有「任务结束 (exit=0)」 | 最近一次完整跑完 ✓ |
+
+**任务指向的脚本还在不在** —— 移动过项目目录后，这里最容易失效：
+
+```powershell
+$t = Get-ScheduledTask -TaskName 'WSL Auto Update'
+$m = [regex]::Match($t.Actions[0].Arguments, '-File\s+"([^"]+)"')
+"$($m.Groups[1].Value)  ->  存在: $(Test-Path $m.Groups[1].Value)"
+```
+
+**没弹窗不代表没工作。** 同意弹窗只在「`distro` 原本是 `Running` **且** GitHub 上有更新版本」时才出现。平时最常见的是「引擎已是最新」直接跳过，或「distro 一直在跑」被安全闸挡下 —— 两种情况都静默完成，详见上方「工作原理」与「设计要点与已知坑」。
+
+> 上面几条命令的输出是中文，PowerShell 控制台可能因代码页显示乱码 —— 那只是显示问题，不影响判断。用支持 UTF-8 的终端，或先 `chcp 65001`。
+
 ---
 
 ## 路径推导
@@ -415,24 +452,79 @@ WSL 的发行版注册在 `HKCU` 下（每用户一份），且需要在关闭 W
 
 ---
 
-## 日常维护清单
+## 日常维护速查
 
-改动脚本之后：
+一页式命令索引。每条命令的展开说明散见上文各节，「详见」列用于定位。**标 ✅ 的需要管理员权限。**
+
+### 任务与升级
+
+| 目的 | 命令 | 管理员 | 详见 |
+|---|:--:|:--:|---|
+| 验证任务状态 | `Get-ScheduledTaskInfo -TaskName 'WSL Auto Update'` | — | 验证任务状态 |
+| 暂停 | `Disable-ScheduledTask -TaskName 'WSL Auto Update'` | ✅ | 本表下方 |
+| 恢复 | `Enable-ScheduledTask -TaskName 'WSL Auto Update'` | ✅ | 本表下方 |
+| 立即跑一次 | `Start-ScheduledTask -TaskName 'WSL Auto Update'` | ✅ | 通过计划任务触发 |
+| 直接跑脚本 | `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Invoke-WslAutoUpdate.ps1` | — | 手动触发完整升级 |
+| 只升级 Ubuntu 包 | `wsl -d Ubuntu -u root -- /usr/local/sbin/wsl-autoupdate-apt.sh` | — | 只升级 Ubuntu 包 |
+| 改执行时间 | `.\Register-WslAutoUpdateTask.ps1 -RunAt '05:00'` | ✅ | 注册 / 卸载 / 改时间 |
+| 卸载任务 | `.\Register-WslAutoUpdateTask.ps1 -Remove` | ✅ | 同上 |
+| 回滚引擎 | `winget install Microsoft.WSL --version 2.7.14.0` | — | 回滚引擎 |
+
+**暂停与恢复**（保留全部配置，事后一条命令即还原）：
 
 ```powershell
-# 1. 同步到备份目录
-.\Sync-WslAutoUpdateBackup.ps1
-
-# 2. 提交并推送
-git add -A
-git commit -m "说明本次改动"
-git push
+Disable-ScheduledTask -TaskName 'WSL Auto Update'   # 暂停
+Enable-ScheduledTask  -TaskName 'WSL Auto Update'   # 恢复
+(Get-ScheduledTask -TaskName 'WSL Auto Update').State   # 确认：Ready / Disabled
 ```
 
-若改的是 `wsl-autoupdate-apt.sh`，下次运行会自动同步进 distro；想立刻生效就手动触发一次完整升级。
+> 暂停**不会撤销任何已完成的升级**。要回退引擎版本用上面「回滚引擎」那条。
 
-补充三点：
+### 备份与版本控制
+
+| 目的 | 命令 |
+|---|---|
+| 手动备份 | `.\Sync-WslAutoUpdateBackup.ps1`（加 `-Mirror` 可删除备份中多余文件） |
+| 改完脚本后的完整流程 | `.\Sync-WslAutoUpdateBackup.ps1` → `git add -A` → `git commit -m "..."` → `git push` |
+
+> ⚠️ **顺序：先 `git commit` 再跑同步。** 反过来的话备份里的历史会落后一个提交 —— 备份含完整 `.git`，同步的是提交后的状态。
+>
+> ⚠️ **移动过项目目录后必须重新注册任务**，否则任务里存的还是旧的绝对路径：
+>
+> ```powershell
+> cd <新目录>
+> .\Register-WslAutoUpdateTask.ps1
+> ```
+
+### 查看与排查
+
+```powershell
+# 任务状态与结果码
+Get-ScheduledTaskInfo -TaskName 'WSL Auto Update' |
+  Select-Object LastRunTime, LastTaskResult, NextRunTime
+```
+
+```bash
+# 运行日志（PowerShell 控制台直接看中文可能乱码，用编辑器或 Git Bash）
+tail -40 /c/Users/Administrator/.wsl-autoupdate/wsl-autoupdate.log
+```
+
+| 现象 | 先看哪里 |
+|---|---|
+| 任务没跑 | `State` 是否为 `Disabled`；`LastRunTime` 有没有更新 |
+| 结果码非 0 | 日志尾部；码的含义见「退出码」一节 |
+| 引擎版本没变 | 日志里搜「跳过」—— 多半是 distro 一直在跑、被安全闸挡下（这是设计行为） |
+| 弹窗没出现 | 只在「distro 原本 Running **且**有新版引擎」时才弹；无新版则不弹 |
+| apt 失败 | 日志里 `### apt-get update 退出码` 与 `### dpkg 状态` 两行 |
+
+### 两条容易被忽略的注意事项
+
+- **WSL 长期忙碌时引擎会一直停在旧版本** —— 每次都被判为「有人在用」而跳过。这是 2026-09-30 那次自动关机事故后的安全设计，不是故障。需要更新时手动跑一次，并确保当时没有长任务在跑。
+- **暂停任务后 distro 内的 apt 就没人管了** —— WSL 自带的 `unattended-upgrades` 定时器在 distro 休眠时不会触发（这正是本任务存在的原因）。暂停超过一两周，建议手动跑一次「只升级 Ubuntu 包」那条命令。
+
+### 几点维护细节
 
 - 新增的脚本文件会被同步脚本**自动纳入**（排除规则是黑名单，不是白名单），无需改同步脚本。
 - `settings.psd1` 会被**同步进备份**（它是部署状态的一部分，恢复时用得上），但它**不会进仓库**。
 - `.git` 也会被同步进备份，所以备份带完整历史。注意 `Get-ChildItem -Recurse` 默认会跳过隐藏目录（`git init` 给 `.git` 加了隐藏属性），同步脚本里必须带 `-Force` —— 这点踩过坑，已在脚本注释里说明。
+- 若改的是 `wsl-autoupdate-apt.sh`，下次运行会自动同步进 distro；想立刻生效就手动触发一次完整升级。
