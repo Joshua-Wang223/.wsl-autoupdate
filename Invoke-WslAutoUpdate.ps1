@@ -6,7 +6,9 @@
 
  阶段 A：唤醒 Ubuntu，执行发行版内 apt update + upgrade
  阶段 B：检查 GitHub 上是否有新 WSL 引擎版本；若有，
-         在强制关闭 WSL 前弹窗征求同意（5 分钟无响应则自动同意），
+         在强制关闭 WSL 前弹窗征求同意 —— 真人点击则升级；超时无人响应则
+         复查届时 distro 是否仍在运行（仍在跑就跳过）；弹窗异常一律跳过。
+         历史事故见 Request-Consent 的注释。
          然后 curl 断点续传下载 MSI → 校验微软签名 → 静默安装
  收尾  ：downloads 内的历史产物按类型限量保留
          引擎 MSI 与 msiexec 安装日志各保留最新 2 个
@@ -55,7 +57,8 @@ $WslExe              = Join-Path $env:SystemRoot 'System32\wsl.exe'
 $CurlExe             = Join-Path $env:SystemRoot 'System32\curl.exe'
 $AptScriptInDistro   = '/usr/local/sbin/wsl-autoupdate-apt.sh'
 $GitHubApi           = 'https://api.github.com/repos/microsoft/WSL/releases/latest'
-$ConsentSeconds      = 300     # 弹窗无响应多久后自动同意升级
+$ConsentSeconds      = 300     # 弹窗无响应多久后跳过引擎升级（注意：超时不会关闭 WSL）
+$SettleSeconds       = 90      # 关机前复查发现 distro 仍在运行时的静候秒数（用于区分「我方活动残留」与「用户在用」）
 $MaxDownloadAttempts = 80      # 断点续传最多重试次数
 $KeepEngineMsi       = 2       # downloads 内最多保留的引擎 MSI 个数（最新下载的 + 升级前那一版，供回滚）
 $KeepInstallLog      = 2       # downloads 内最多保留的 msiexec 安装日志个数（最新一次 + 上一次）
@@ -94,6 +97,44 @@ function Invoke-Wsl {
     }
     $text = (($lines | ForEach-Object { $_ -replace "`0", '' }) -join "`n")
     return [PSCustomObject]@{ Text = $text; Code = $code }
+}
+
+# 读取指定 distro 当前状态，返回 Running / Stopped / Installing / Unknown。
+# 阶段 0 与「超时后复查」都用它，避免两处解析逻辑不一致。
+function Get-DistroState {
+    param([Parameter(Mandatory)][string]$Name)
+    $res = Invoke-Wsl @('--list', '--verbose')
+    foreach ($line in ($res.Text -split "`n")) {
+        if ($line -match ('^\s*\*?\s*' + [regex]::Escape($Name) + '\s')) {
+            if     ($line -match 'Running')    { return 'Running' }
+            elseif ($line -match 'Stopped')    { return 'Stopped' }
+            elseif ($line -match 'Installing') { return 'Installing' }
+        }
+    }
+    return 'Unknown'
+}
+
+# 判断 distro 此刻是否确实空闲（可供安全关闭）。
+# 难点：看到 Running 未必是用户在跑 —— 本任务自己的 apt 步骤刚唤醒过它，
+# 而 WSL 在最后一个客户端断开后要过一段时间才终止 VM，所以那一刻的
+# Running 可能只是我方活动的残留。
+# 因此看到 Running 时先静候 $SettleSeconds 再复查：
+#   转为 Stopped -> 说明刚才是我方残留，可以关闭
+#   仍 Running   -> 判定为用户在用，放弃关闭
+# 方向偏保守：宁可多等，也不误关。
+function Test-DistroIdle {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$SettleSeconds = 90
+    )
+    $s1 = Get-DistroState -Name $Name
+    if ($s1 -eq 'Stopped') { return $true }
+
+    Write-Log "关机前检查: distro 状态为 $s1，可能是本任务自身活动残留；静候 ${SettleSeconds}s 后复查"
+    Start-Sleep -Seconds $SettleSeconds
+    $s2 = Get-DistroState -Name $Name
+    Write-Log "静候后复查: $s2"
+    return ($s2 -eq 'Stopped')
 }
 
 function ConvertTo-NormVersion {
@@ -152,17 +193,30 @@ function Remove-OldArtifact {
     return $removed
 }
 
-# ================= 同意弹窗（5 分钟无响应 → 自动同意） =================
+# ================= 同意弹窗 =================
+# 返回值约定：
+#     user-approved  Proceed=$true   真人点击「立即升级」—— 唯一无条件放行的情况
+#     user-declined  Proceed=$false  真人点「跳过本次」或直接关窗
+#     prompt-failed  Proceed=$false  弹窗不可用 / 抛异常 —— 无法确认有人在场，跳过
+#     timeout        Proceed=$false  超时无响应 —— **交由调用方按届时状态决定**
+#
+# timeout 的 Proceed 取 $false 只是保守默认值：调用方必须显式处理这个 Reason，
+# 否则等价于跳过。这样即便调用方将来漏改，也不会意外关掉 WSL。
+#
+# 为什么超时不在这里拍板：distro 处于 Running 并不等于「人在电脑前」——
+# 长时批处理任务同样会让它保持运行。2026-09-30 03:36 就因此出过事故：
+# 弹窗超时后自动同意，执行了 wsl --shutdown，中断了正在跑的长任务
+# （distro 直到 07:49 才重启）。因此超时后要先看「此刻」还有没有实例在跑。
 function Request-Consent {
     param([string]$Message, [int]$TimeoutSeconds = 300)
 
-    $result = [PSCustomObject]@{ Proceed = $true; Reason = 'prompt-failed' }
+    $result = [PSCustomObject]@{ Proceed = $false; Reason = 'prompt-failed' }
 
     try {
         Add-Type -AssemblyName System.Windows.Forms
         Add-Type -AssemblyName System.Drawing
     } catch {
-        Write-Log "无法加载 WinForms，跳过弹窗，按“无响应自动同意”处理: $($_.Exception.Message)" 'WARN'
+        Write-Log "无法加载 WinForms，弹窗不可用，本次跳过引擎升级（不关闭 WSL）: $($_.Exception.Message)" 'WARN'
         return $result
     }
 
@@ -217,7 +271,7 @@ function Request-Consent {
             if ($form.DialogResult -ne [System.Windows.Forms.DialogResult]::None) { break }
             if ((Get-Date) -ge $deadline) { $timedOut = $true; break }
             $rem = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds)
-            $countdown.Text = "若 $rem 秒内无操作，将自动继续升级。"
+            $countdown.Text = "若 $rem 秒内无操作，届时将检查 WSL 是否仍在运行：在跑则跳过，已歇下则继续。"
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 150
         }
@@ -226,11 +280,12 @@ function Request-Consent {
         if ($form.Visible) { $form.Close() }
         $form.Dispose()
 
-        if ($timedOut)          { $result = [PSCustomObject]@{ Proceed = $true;  Reason = 'timeout' } }
-        elseif ($dialog -eq [System.Windows.Forms.DialogResult]::OK)     { $result = [PSCustomObject]@{ Proceed = $true;  Reason = 'user-approved' } }
-        else                    { $result = [PSCustomObject]@{ Proceed = $false; Reason = 'user-declined' } }
+        # 只有明确点击「立即升级」才返回 Proceed=$true；timeout 的最终决定权在调用方
+        if ($timedOut)   { $result = [PSCustomObject]@{ Proceed = $false; Reason = 'timeout' } }
+        elseif ($dialog -eq [System.Windows.Forms.DialogResult]::OK) { $result = [PSCustomObject]@{ Proceed = $true;  Reason = 'user-approved' } }
+        else             { $result = [PSCustomObject]@{ Proceed = $false; Reason = 'user-declined' } }
     } catch {
-        Write-Log "弹窗异常，按“无响应自动同意”处理: $($_.Exception.Message)" 'WARN'
+        Write-Log "弹窗异常，本次跳过引擎升级（不关闭 WSL）: $($_.Exception.Message)" 'WARN'
     }
     return $result
 }
@@ -247,16 +302,8 @@ Write-Log "apt 脚本: $AptScriptHost  ==> distro: $AptScriptHostWsl"
 
 # ---------- 阶段 0：记录 distro 初始状态 ----------
 # 用于判断“关闭 WSL 是否会打断用户”。若任务开始前 distro 本来就是 Running，
-# 说明用户很可能开着终端，此时才需要弹窗征求同意。
-$initialState = 'Unknown'
-$listRes = Invoke-Wsl @('--list', '--verbose')
-foreach ($line in ($listRes.Text -split "`n")) {
-    if ($line -match ('^\s*\*?\s*' + [regex]::Escape($Distro) + '\s')) {
-        if     ($line -match 'Running')    { $initialState = 'Running' }
-        elseif ($line -match 'Stopped')    { $initialState = 'Stopped' }
-        elseif ($line -match 'Installing') { $initialState = 'Installing' }
-    }
-}
+# 说明有别的东西正在用它，此时才需要弹窗征求同意。
+$initialState = Get-DistroState -Name $Distro
 Write-Log "distro '$Distro' 初始状态: $initialState"
 
 if ($initialState -eq 'Unknown') {
@@ -343,21 +390,47 @@ try {
         Write-Log "地址: $($asset.browser_download_url)"
 
         # --- 征求同意：仅当任务开始前 distro 已在运行，才可能打断用户 ---
+        # 注意：distro 处于 Running 并不等于「人在电脑前」—— 长时批处理任务
+        # 同样会让它保持运行，所以不能凭「5 分钟前是 Running」就认定有人守着。
+        # $approvalMode 记录「这次关闭是谁批的」：
+        #   user = 真人明确点击过，关机前不再重复检查（他已知情并同意）
+        #   auto = 超时判定或本来就空闲，关机前还要再过一道闸（见下方 Test-DistroIdle）
         $proceed = $true
+        $approvalMode = 'auto'
         if ($initialState -eq 'Running') {
             $msg = "检测到 WSL 引擎有新版本：$installedRaw -> $latestTag" + [Environment]::NewLine + [Environment]::NewLine +
-                   "安装新引擎需要关闭 WSL，这会终止你当前正在使用的所有 WSL 终端会话。" + [Environment]::NewLine + [Environment]::NewLine +
+                   "安装新引擎需要关闭 WSL，这会中断其中正在运行的任务与终端会话。" + [Environment]::NewLine + [Environment]::NewLine +
                    '是否现在升级？'
-            Write-Log "distro 初始为 Running，弹窗征求同意（超时 ${ConsentSeconds}s 自动同意）"
+            Write-Log "distro 初始为 Running，弹窗征求同意（超时 ${ConsentSeconds}s 后按届时状态决定）"
             $consent = Request-Consent -Message $msg -TimeoutSeconds $ConsentSeconds
-            Write-Log "用户决定: $($consent.Reason) (Proceed=$($consent.Proceed))"
+            Write-Log "弹窗结果: $($consent.Reason) (Proceed=$($consent.Proceed))"
             $proceed = $consent.Proceed
+            if ($consent.Reason -eq 'user-approved') { $approvalMode = 'user' }
+
+            if ($consent.Reason -eq 'timeout') {
+                # 超时无响应：以「此刻」distro 是否仍在运行作为判据，而不是拿
+                # 5 分钟前的状态推断。若这期间用户已结束所有会话、distro 自动
+                # 歇下，关闭它就影响不到任何人，此时才允许继续；只要还有实例
+                # 在跑（无论是终端还是批处理任务）就一律跳过。
+                $stateNow = Get-DistroState -Name $Distro
+                Write-Log "超时后复查 distro 状态: $stateNow"
+                # 只认明确的 Stopped 为「确认没在跑」。Running/Installing/
+                # Unknown 一律按「可能有实例在用」处理 —— Unknown 只是没拿到
+                # 证据，不等于确认空闲，这种时候不能朝放行的方向猜。
+                if ($stateNow -eq 'Stopped') {
+                    $proceed = $true
+                    Write-Log '已无运行中的 WSL 实例（状态 Stopped），自动继续升级'
+                } else {
+                    $proceed = $false
+                    Write-Log "distro 状态为 $stateNow，无法确认已空闲，跳过本次引擎升级（不关闭 WSL）"
+                }
+            }
         } else {
             Write-Log "distro 初始为 Stopped，未打断任何会话，直接升级"
         }
 
         if (-not $proceed) {
-            Write-Log '用户选择跳过本次引擎升级'
+            Write-Log '本次跳过引擎升级，WSL 未被关闭；下次运行会再询问'
         } else {
             # --- 断点续传下载 ---
             $msiPath = Join-Path $DownloadDir $asset.name
@@ -393,27 +466,48 @@ try {
                 } else {
                     Write-Log "签名校验通过: $($sig.SignerCertificate.Subject)"
 
-                    # --- 关闭 WSL 并静默安装 ---
-                    $shut = Invoke-Wsl @('--shutdown')
-                    Write-Log "已执行 wsl --shutdown (exit=$($shut.Code))"
-                    Start-Sleep -Seconds 5
-
-                    $installLog = Join-Path $DownloadDir ("install-{0}.log" -f $latestTag)
-                    $p = Start-Process -FilePath 'msiexec.exe' `
-                                       -ArgumentList @('/i', $msiPath, '/qn', '/norestart', '/l*v', $installLog) `
-                                       -Wait -PassThru
-                    Write-Log "msiexec 退出码: $($p.ExitCode)"
-
-                    if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
-                        Start-Sleep -Seconds 3
-                        $afterRes = Invoke-Wsl @('--version')
-                        $am = [regex]::Match($afterRes.Text, 'WSL version:\s*([0-9]+(?:\.[0-9]+)+)')
-                        $akm = [regex]::Match($afterRes.Text, 'Kernel version:\s*(\S+)')
-                        if ($am.Success) { Write-Log "升级后: WSL $($am.Groups[1].Value), 内核 $($akm.Groups[1].Value)" }
-                        Write-Log '引擎升级成功'
+                    # --- 关机前最后一道闸：锁住「授权 → 下载 → 关机」之间的状态漂移 ---
+                    # 授权发生在下载之前，而下载可能耗时数分钟；若期间有人启动了
+                    # WSL，直接关机就会砍掉他刚起的任务 —— 前面那次复查的结论
+                    # 到这时已经过期了。所以真正关机前必须重判一次。
+                    # 只有真人明确点击过的免检：他是在知情前提下同意的，且从点击
+                    # 到关机之间只隔着这几行代码，没有可供漂移的窗口。
+                    $gateOpen = $true
+                    if ($approvalMode -eq 'user') {
+                        Write-Log '关机前复查: 本次为真人明确批准，不再重复检查'
                     } else {
-                        Write-Log "引擎安装失败，退出码 $($p.ExitCode)，详见 $installLog" 'ERROR'
-                        if ($exitCode -eq 0) { $exitCode = 7 }
+                        $gateOpen = Test-DistroIdle -Name $Distro -SettleSeconds $SettleSeconds
+                        if ($gateOpen) {
+                            Write-Log '关机前复查通过: distro 已空闲，可以安全关闭'
+                        } else {
+                            Write-Log '关机前复查未通过: distro 仍在运行（或状态不明），放弃本次安装、不关闭 WSL' 'WARN'
+                            Write-Log "MSI 已保留在 $msiPath；下次运行会发现它已完整并跳过下载，无需重新下载"
+                        }
+                    }
+
+                    if ($gateOpen) {
+                        # --- 关闭 WSL 并静默安装 ---
+                        $shut = Invoke-Wsl @('--shutdown')
+                        Write-Log "已执行 wsl --shutdown (exit=$($shut.Code))"
+                        Start-Sleep -Seconds 5
+
+                        $installLog = Join-Path $DownloadDir ("install-{0}.log" -f $latestTag)
+                        $p = Start-Process -FilePath 'msiexec.exe' `
+                                           -ArgumentList @('/i', $msiPath, '/qn', '/norestart', '/l*v', $installLog) `
+                                           -Wait -PassThru
+                        Write-Log "msiexec 退出码: $($p.ExitCode)"
+
+                        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+                            Start-Sleep -Seconds 3
+                            $afterRes = Invoke-Wsl @('--version')
+                            $am = [regex]::Match($afterRes.Text, 'WSL version:\s*([0-9]+(?:\.[0-9]+)+)')
+                            $akm = [regex]::Match($afterRes.Text, 'Kernel version:\s*(\S+)')
+                            if ($am.Success) { Write-Log "升级后: WSL $($am.Groups[1].Value), 内核 $($akm.Groups[1].Value)" }
+                            Write-Log '引擎升级成功'
+                        } else {
+                            Write-Log "引擎安装失败，退出码 $($p.ExitCode)，详见 $installLog" 'ERROR'
+                            if ($exitCode -eq 0) { $exitCode = 7 }
+                        }
                     }
                 }
             }
